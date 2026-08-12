@@ -21,10 +21,14 @@ ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '0').split(',')))
 PORT = int(os.environ.get('PORT', 8080))
 RAILWAY_DOMAIN = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
 
-# Encryption key – must be set in environment
+# ---------- ENCRYPTION KEY (with auto‑generation fallback) ----------
 ENCRYPTION_KEY = os.environ.get('ENCRYPTION_KEY')
 if not ENCRYPTION_KEY:
-    raise Exception("ENCRYPTION_KEY environment variable not set! Generate one using: Fernet.generate_key().decode()")
+    from cryptography.fernet import Fernet
+    ENCRYPTION_KEY = Fernet.generate_key().decode()
+    print(f"🔑 AUTO‑GENERATED ENCRYPTION_KEY: {ENCRYPTION_KEY}")
+    print("⚠️  Please copy this key and set it as ENCRYPTION_KEY in Railway variables, then redeploy.")
+    # We still proceed with the auto‑generated key so the bot starts.
 cipher = Fernet(ENCRYPTION_KEY.encode())
 
 SESSION_DIR = Path('sessions')
@@ -347,13 +351,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session_path = SESSION_DIR / f"{session_name}.session"
             if session_path.exists():
                 encrypted_data = encrypt_file_data(session_path)
-                # Send encrypted file
                 await update.message.reply_document(
                     document=io.BytesIO(encrypted_data),
                     filename=f"{session_name}.session",
                     caption=f"🔒 **Encrypted session file for {session_name}**\n\nThis file is locked to my bot. Send it back to verify."
                 )
-                # Delete plaintext file
                 session_path.unlink()
             else:
                 await update.message.reply_text("⚠️ Session created but file not found.")
@@ -409,7 +411,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             phone = context.user_data['phone']
             add_session(session_name, me.phone, password, user_id)
 
-            # ----- ENCRYPT SESSION FILE AND SEND -----
             session_path = SESSION_DIR / f"{session_name}.session"
             if session_path.exists():
                 encrypted_data = encrypt_file_data(session_path)
@@ -432,7 +433,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ 2FA error: {e}")
 
     else:
-        # If user sends something else, ignore or show help
         await update.message.reply_text("❓ Use /start to see available options.")
 
 # ---------- RESEND OTP (callback) ----------
@@ -506,7 +506,6 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     claim_map[session_name] = user_id
     add_claim(session_name, user_id)
 
-    # Check if we have a decrypted session file; if not, we can't start listener
     session_path = SESSION_DIR / f"{session_name}.session"
     if not session_path.exists():
         await update.message.reply_text(
@@ -612,7 +611,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     session_name = document.file_name.replace('.session', '')
-    # Check if session is registered in DB
     session = get_session(session_name)
     if not session:
         await update.message.reply_text(
@@ -621,7 +619,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Download encrypted file as bytes
     file = await document.get_file()
     encrypted_data = await file.download_as_bytearray()
 
@@ -634,16 +631,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Save decrypted session file
     session_path = SESSION_DIR / f"{session_name}.session"
     with open(session_path, 'wb') as f:
         f.write(decrypted_data)
 
-    # Claim it for the user
     claim_map[session_name] = user_id
     add_claim(session_name, user_id)
 
-    # Start listener if not running
     if session_name not in clients:
         import threading
         password = session[3]
@@ -679,7 +673,7 @@ if __name__ == '__main__':
     print("🤖 Bot starting...")
     print(f"📁 Sessions: {SESSION_DIR.absolute()}")
     print(f"📊 Database: {DB_PATH.absolute()}")
-    print("🔒 Encryption key loaded.")
+    print(f"🔒 Encryption key: {'*' * 10} (set)")
 
     if RAILWAY_DOMAIN:
         webhook_url = f'https://{RAILWAY_DOMAIN}/webhook'
