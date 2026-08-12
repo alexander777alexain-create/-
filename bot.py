@@ -3,7 +3,7 @@ import re
 import os
 import sqlite3
 import zipfile
-from io import BytesIO
+import io
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -11,6 +11,7 @@ from telegram.ext import (
     filters, ContextTypes
 )
 from telethon import TelegramClient, events
+from cryptography.fernet import Fernet
 
 # ---------- CONFIG ----------
 API_ID = int(os.environ.get('API_ID', 12345))
@@ -19,6 +20,12 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN', 'your_bot_token')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '0').split(',')))
 PORT = int(os.environ.get('PORT', 8080))
 RAILWAY_DOMAIN = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+
+# Encryption key – must be set in environment
+ENCRYPTION_KEY = os.environ.get('ENCRYPTION_KEY')
+if not ENCRYPTION_KEY:
+    raise Exception("ENCRYPTION_KEY environment variable not set! Generate one using: Fernet.generate_key().decode()")
+cipher = Fernet(ENCRYPTION_KEY.encode())
 
 SESSION_DIR = Path('sessions')
 SESSION_DIR.mkdir(exist_ok=True)
@@ -105,6 +112,17 @@ def delete_session(name):
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+# ---------- ENCRYPTION HELPERS ----------
+def encrypt_file_data(file_path):
+    """Read file, encrypt, return bytes"""
+    with open(file_path, 'rb') as f:
+        data = f.read()
+    return cipher.encrypt(data)
+
+def decrypt_file_data(encrypted_data):
+    """Decrypt bytes and return plaintext bytes"""
+    return cipher.decrypt(encrypted_data)
+
 # ---------- GLOBALS ----------
 clients = {}
 claim_map = {}
@@ -162,6 +180,10 @@ async def start_listener(session_name, password=None):
         await client.run_until_disconnected()
     except Exception as e:
         print(f"❌ Listener error {session_name}: {e}")
+    finally:
+        # Clean up decrypted file after listener stops
+        if session_path.exists():
+            session_path.unlink()
 
 def run_listener(session_name, password=None):
     loop = asyncio.new_event_loop()
@@ -187,14 +209,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg = (
-        "🤖 **Session Bot v2.5**\n\n"
+        "🤖 **Session Bot v2.6**\n\n"
         "Welcome! Use the buttons below to get started.\n\n"
         "**How it works:**\n"
         "1. Create a new session\n"
-        "2. Bot sends `.session` file\n"
-        "3. Send file back to verify\n"
-        "4. Login to Telegram with that number\n"
-        "5. OTP appears here automatically"
+        "2. Bot sends an **encrypted** `.session` file\n"
+        "3. Only this bot can read it – it's locked to my secret key\n"
+        "4. Send the file back to verify\n"
+        "5. Login to Telegram with that number\n"
+        "6. OTP appears here automatically\n\n"
+        "🔒 All session files are encrypted with a unique key."
     )
     await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=reply_markup)
 
@@ -234,7 +258,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session_files:
             await query.edit_message_text("❌ No session files found.")
             return
-        zip_buffer = BytesIO()
+        zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for file_path in session_files:
                 zip_file.write(file_path, arcname=file_path.name)
@@ -260,7 +284,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "**How to use:**\n"
             "1. Use 'Create New Session' button or /create\n"
             "2. Enter phone → Enter OTP\n"
-            "3. Bot sends `.session` file automatically\n"
+            "3. Bot sends an **encrypted** `.session` file\n"
             "4. Send that file back to verify\n"
             "5. Login to Telegram with that number\n"
             "6. OTP forwarded here"
@@ -319,19 +343,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             phone = context.user_data['phone']
             add_session(session_name, me.phone, None, user_id)
 
-            # Send session file automatically
+            # ----- ENCRYPT SESSION FILE AND SEND -----
             session_path = SESSION_DIR / f"{session_name}.session"
             if session_path.exists():
+                encrypted_data = encrypt_file_data(session_path)
+                # Send encrypted file
                 await update.message.reply_document(
-                    document=open(session_path, 'rb'),
+                    document=io.BytesIO(encrypted_data),
                     filename=f"{session_name}.session",
-                    caption=f"📁 **Session file for {session_name}**\n\nSend this file back to verify & start listening."
+                    caption=f"🔒 **Encrypted session file for {session_name}**\n\nThis file is locked to my bot. Send it back to verify."
                 )
+                # Delete plaintext file
+                session_path.unlink()
             else:
                 await update.message.reply_text("⚠️ Session created but file not found.")
 
             await update.message.reply_text(
-                f"✅ **Session created!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nNow send the `.session` file (just received) back to verify.",
+                f"✅ **Session created!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nNow send the encrypted `.session` file (just received) back to verify.",
                 parse_mode='Markdown'
             )
             context.user_data['state'] = None
@@ -381,18 +409,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             phone = context.user_data['phone']
             add_session(session_name, me.phone, password, user_id)
 
+            # ----- ENCRYPT SESSION FILE AND SEND -----
             session_path = SESSION_DIR / f"{session_name}.session"
             if session_path.exists():
+                encrypted_data = encrypt_file_data(session_path)
                 await update.message.reply_document(
-                    document=open(session_path, 'rb'),
+                    document=io.BytesIO(encrypted_data),
                     filename=f"{session_name}.session",
-                    caption=f"📁 **Session file for {session_name}**\n\nSend this file back to verify & start listening."
+                    caption=f"🔒 **Encrypted session file for {session_name}**\n\nThis file is locked to my bot. Send it back to verify."
                 )
+                session_path.unlink()
             else:
                 await update.message.reply_text("⚠️ Session created but file not found.")
 
             await update.message.reply_text(
-                f"✅ **Session created with 2FA!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nNow send the `.session` file (just received) back to verify.",
+                f"✅ **Session created with 2FA!**\n\n📱 Phone: `{me.phone}`\n📁 Name: `{session_name}`\n\nNow send the encrypted `.session` file (just received) back to verify.",
                 parse_mode='Markdown'
             )
             context.user_data['state'] = None
@@ -475,6 +506,16 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     claim_map[session_name] = user_id
     add_claim(session_name, user_id)
 
+    # Check if we have a decrypted session file; if not, we can't start listener
+    session_path = SESSION_DIR / f"{session_name}.session"
+    if not session_path.exists():
+        await update.message.reply_text(
+            f"⚠️ Session `{session_name}` is registered but no decrypted file found.\n"
+            "Please send the encrypted `.session` file first.",
+            parse_mode='Markdown'
+        )
+        return
+
     if session_name not in clients:
         import threading
         password = session[3]
@@ -548,7 +589,7 @@ async def cmd_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not session_files:
         await update.message.reply_text("❌ No session files found.")
         return
-    zip_buffer = BytesIO()
+    zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         for file_path in session_files:
             zip_file.write(file_path, arcname=file_path.name)
@@ -559,7 +600,7 @@ async def cmd_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📦 All session files ({len(session_files)} files). Keep them safe!"
     )
 
-# ---------- FILE HANDLER ----------
+# ---------- FILE HANDLER (with decryption) ----------
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     document = update.message.document
@@ -571,21 +612,38 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     session_name = document.file_name.replace('.session', '')
+    # Check if session is registered in DB
     session = get_session(session_name)
     if not session:
         await update.message.reply_text(
-            f"❌ **Session `{session_name}` not registered.**\nUse /create first.",
+            f"❌ **Session `{session_name}` not registered.**\nUse `/create` first.",
             parse_mode='Markdown'
         )
         return
 
+    # Download encrypted file as bytes
     file = await document.get_file()
-    save_path = SESSION_DIR / f"{session_name}.session"
-    await file.download_to_drive(save_path)
+    encrypted_data = await file.download_as_bytearray()
 
+    try:
+        decrypted_data = decrypt_file_data(bytes(encrypted_data))
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Failed to decrypt file. Either it's not encrypted with my key or corrupted.\nError: {e}",
+            parse_mode='Markdown'
+        )
+        return
+
+    # Save decrypted session file
+    session_path = SESSION_DIR / f"{session_name}.session"
+    with open(session_path, 'wb') as f:
+        f.write(decrypted_data)
+
+    # Claim it for the user
     claim_map[session_name] = user_id
     add_claim(session_name, user_id)
 
+    # Start listener if not running
     if session_name not in clients:
         import threading
         password = session[3]
@@ -621,6 +679,7 @@ if __name__ == '__main__':
     print("🤖 Bot starting...")
     print(f"📁 Sessions: {SESSION_DIR.absolute()}")
     print(f"📊 Database: {DB_PATH.absolute()}")
+    print("🔒 Encryption key loaded.")
 
     if RAILWAY_DOMAIN:
         webhook_url = f'https://{RAILWAY_DOMAIN}/webhook'
